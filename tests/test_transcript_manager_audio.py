@@ -167,6 +167,7 @@ async def test_process_video_extracts_audio_and_uploads_mp3(
         filename: str,
         content_type: str,
         model: str,
+        response_format: str = "json",
     ) -> Dict[str, Any]:
         captured.update(
             api_key=api_key,
@@ -296,7 +297,7 @@ async def test_process_video_source_audio_passthrough(
 
     captured: Dict[str, Any] = {}
 
-    async def fake_call(*, api_key, file_path, filename, content_type, model):
+    async def fake_call(*, api_key, file_path, filename, content_type, model, response_format="json"):
         captured.update(
             file_path=file_path,
             filename=filename,
@@ -344,7 +345,7 @@ async def test_process_video_legacy_upload_when_flag_disabled(
 
     captured: Dict[str, Any] = {}
 
-    async def fake_call(*, api_key, file_path, filename, content_type, model):
+    async def fake_call(*, api_key, file_path, filename, content_type, model, response_format="json"):
         captured.update(
             file_path=file_path, filename=filename, content_type=content_type
         )
@@ -381,7 +382,7 @@ async def test_process_video_tempdir_cleanup_failure_only_warns(
         mp3.write_bytes(b"x")
         return mp3
 
-    async def fake_call(*, api_key, file_path, filename, content_type, model):
+    async def fake_call(*, api_key, file_path, filename, content_type, model, response_format="json"):
         return {"text": "ok"}
 
     monkeypatch.setattr(tm_mod, "extract_audio", fake_extract)
@@ -438,7 +439,7 @@ async def test_process_video_does_not_log_api_key_plaintext(
         mp3.write_bytes(b"x")
         return mp3
 
-    async def fake_call(*, api_key, file_path, filename, content_type, model):
+    async def fake_call(*, api_key, file_path, filename, content_type, model, response_format="json"):
         # Verify the manager DID resolve the env-var key.
         assert api_key == sentinel_key
         return {"text": "ok"}

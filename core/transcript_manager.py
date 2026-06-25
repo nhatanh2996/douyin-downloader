@@ -28,6 +28,30 @@ _SOURCE_AUDIO_MIME = {
     ".ogg": "audio/ogg",
 }
 
+# Maps user-facing response_format names → the API response_format value to use.
+# "txt" uses "json" so we can extract the text field without a separate API call.
+_USER_TO_API_FORMAT: Dict[str, str] = {
+    "txt": "json",
+    "json": "json",
+    "verbose_json": "verbose_json",
+    "srt": "srt",
+    "vtt": "vtt",
+    "text": "text",
+}
+
+# Output file extensions for each user-facing format.
+_USER_FORMAT_EXT: Dict[str, str] = {
+    "txt": ".transcript.txt",
+    "json": ".transcript.json",
+    "verbose_json": ".transcript.verbose_json.json",
+    "srt": ".transcript.srt",
+    "vtt": ".transcript.vtt",
+    "text": ".transcript.txt",
+}
+
+# API formats whose response body is JSON (everything else is plain text).
+_JSON_API_FORMATS = frozenset({"json", "verbose_json"})
+
 
 def _mask_api_key_local(value: str) -> str:
     """Pure mirror of ``server.app._mask_api_key`` for use inside the
@@ -245,16 +269,31 @@ class TranscriptManager:
                 upload_content_type = _SOURCE_AUDIO_MIME[source_ext]
 
             try:
-                payload = await self._call_openai_transcription(
-                    api_key=api_key,
-                    file_path=upload_path,
-                    filename=upload_filename,
-                    content_type=upload_content_type,
-                    model=model,
-                )
-                # ``_write_outputs`` re-derives the text from ``payload`` —
-                # no need to pre-extract it here.
-                await self._write_outputs(payload, text_path, json_path)
+                # Determine the unique API response_formats we need, preserving
+                # insertion order so the first failing call is predictable.
+                user_formats = self._response_formats()
+                seen_api_fmts: set = set()
+                api_formats_needed: List[str] = []
+                for uf in user_formats:
+                    af = _USER_TO_API_FORMAT.get(uf)
+                    if af and af not in seen_api_fmts:
+                        seen_api_fmts.add(af)
+                        api_formats_needed.append(af)
+                if not api_formats_needed:
+                    api_formats_needed = ["json"]
+
+                api_responses: Dict[str, Any] = {}
+                for api_fmt in api_formats_needed:
+                    api_responses[api_fmt] = await self._call_openai_transcription(
+                        api_key=api_key,
+                        file_path=upload_path,
+                        filename=upload_filename,
+                        content_type=upload_content_type,
+                        model=model,
+                        response_format=api_fmt,
+                    )
+
+                await self._write_outputs(api_responses, text_path.parent, video_path.stem)
                 await self._record_job(
                     aweme_id=aweme_id,
                     video_path=video_path,
@@ -307,18 +346,31 @@ class TranscriptManager:
                     )
 
     async def _write_outputs(
-        self, payload: Dict[str, Any], text_path: Path, json_path: Path
+        self,
+        api_responses: Dict[str, Any],
+        output_dir: Path,
+        stem: str,
     ) -> None:
-        formats = set(self._response_formats())
+        for ufmt in self._response_formats():
+            api_fmt = _USER_TO_API_FORMAT.get(ufmt)
+            if not api_fmt or api_fmt not in api_responses:
+                continue
+            response = api_responses[api_fmt]
+            ext = _USER_FORMAT_EXT.get(ufmt, f".transcript.{ufmt}")
+            out_path = output_dir / f"{stem}{ext}"
 
-        if "txt" in formats:
-            text = str(payload.get("text", "")).strip()
-            async with aiofiles.open(text_path, "w", encoding="utf-8") as f:
-                await f.write(text)
-
-        if "json" in formats:
-            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            if ufmt == "txt":
+                text = str(
+                    response.get("text", "") if isinstance(response, dict) else response
+                ).strip()
+                async with aiofiles.open(out_path, "w", encoding="utf-8") as f:
+                    await f.write(text)
+            elif api_fmt in _JSON_API_FORMATS:
+                async with aiofiles.open(out_path, "w", encoding="utf-8") as f:
+                    await f.write(json.dumps(response, ensure_ascii=False, indent=2))
+            else:
+                async with aiofiles.open(out_path, "w", encoding="utf-8") as f:
+                    await f.write(str(response))
 
     async def _call_openai_transcription(
         self,
@@ -328,7 +380,8 @@ class TranscriptManager:
         filename: str,
         content_type: str,
         model: str,
-    ) -> Dict[str, Any]:
+        response_format: str = "json",
+    ) -> Any:
         """POST a multipart transcription request.
 
         ``file_path`` is whatever the caller decided to upload — could be
@@ -336,6 +389,9 @@ class TranscriptManager:
         ffmpeg-extracted mp3. The caller passes the appropriate
         ``filename`` + ``content_type`` so the multipart body advertises
         the right MIME.
+
+        Returns a dict for ``json``/``verbose_json`` formats, or a plain
+        string for ``text``/``srt``/``vtt`` formats.
         """
         if not file_path.exists():
             raise FileNotFoundError(f"Upload file not found: {file_path}")
@@ -346,7 +402,7 @@ class TranscriptManager:
 
         form = aiohttp.FormData()
         form.add_field("model", model)
-        form.add_field("response_format", "json")
+        form.add_field("response_format", response_format)
         if language_hint:
             form.add_field("language", language_hint)
 
@@ -376,10 +432,12 @@ class TranscriptManager:
                             f"OpenAI transcription failed: status={response.status}, body={body}"
                         )
 
-                    payload = await response.json(content_type=None)
-                    if not isinstance(payload, dict):
-                        raise RuntimeError("OpenAI transcription returned invalid payload")
-                    return payload
+                    if response_format in _JSON_API_FORMATS:
+                        payload = await response.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            raise RuntimeError("OpenAI transcription returned invalid payload")
+                        return payload
+                    return await response.text()
 
     @staticmethod
     def _guess_video_content_type(video_path: Path) -> str:
